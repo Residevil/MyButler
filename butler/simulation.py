@@ -1,3 +1,5 @@
+import argparse
+import csv
 import os
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -40,7 +42,25 @@ def action_to_string(action):
     }
     return mapping.get(action, "Unknown Action")
 
-def run_simulation(steps=150):
+DIAGNOSTIC_FIELDS = [
+    "belief_calm_raw",
+    "belief_calm_pinned",
+    "predicted_calm_obs_pre",
+    "predicted_calm_obs",
+    "predicted_calm_intero",
+    "obs_calm",
+    "obs_error_calm_vs_obs",
+    "obs_error_calm_vs_true",
+    "intero_error_calm_vs_true",
+    "belief_calm_delta",
+    "sensory_error_calm",
+    "transition_pred_calm",
+    "transition_error_calm",
+    "transition_logvar_calm",
+]
+
+
+def run_simulation(steps=150, diagnostic_csv=None):
     logger = setup_logging()
     logger.info("Initializing MyButler Homeostatic Active Inference Simulation")
     
@@ -50,7 +70,7 @@ def run_simulation(steps=150):
     
     # Reset env and agent
     obs = env.reset()
-    prev_belief = agent.reset(obs)
+    agent.reset(obs)
     
     # Histories for plotting
     history = {
@@ -73,15 +93,19 @@ def run_simulation(steps=150):
         "loss_total": [],
         "loss_trans": [],
         "loss_obs": [],
-        "loss_essential": []
+        "loss_essential": [],
+        **{k: [] for k in DIAGNOSTIC_FIELDS},
     }
+
+    diag_rows = []
     
     logger.info("Starting closed sensorimotor loop execution...")
     
     last_action = None
+    prev_transition_pred_calm = None
     for step in range(steps):
         # 1. Belief update (Sensory correction)
-        belief = agent.update_belief(obs, last_action)
+        belief, diag = agent.update_belief(obs, last_action)
         
         # 2. Action planning & selection
         action, (survival_cost, epistemic_val, efe) = agent.select_action()
@@ -91,6 +115,15 @@ def run_simulation(steps=150):
         
         # Extract essential variables directly from info
         true_e = info["true_essential"]
+        true_calm = float(true_e[2])
+        diag["true_calm"] = true_calm
+        diag["obs_error_calm_vs_true"] = diag["predicted_calm_obs"] - true_calm
+        diag["intero_error_calm_vs_true"] = diag["predicted_calm_intero"] - true_calm
+        diag["transition_error_calm"] = (
+            None if prev_transition_pred_calm is None
+            else prev_transition_pred_calm - true_calm
+        )
+        prev_transition_pred_calm = diag["transition_pred_calm"]
         
         # 4. Store experience in buffer
         agent.store_transition(belief, action, next_obs, next_obs, true_e)
@@ -102,9 +135,13 @@ def run_simulation(steps=150):
         logger.info(
             f"Step {step:03d} | Time: {info['time_of_day']:.2f} | "
             f"Act: {action_to_string(action)} | "
-            f"Comfort: {true_e[0]:.2f} (Belief: {belief[0]:.2f}) | "
-            f"Calm: {true_e[2]:.2f} (Belief: {belief[2]:.2f}) | "
-            f"Avg well-being: {reward:.2f} | "
+            f"Calm: {true_calm:.2f} (Belief: {belief[2]:.2f}) | "
+            f"pred_obs={diag['predicted_calm_obs']:.3f} "
+            f"pred_intero={diag['predicted_calm_intero']:.3f} | "
+            f"err_true={diag['obs_error_calm_vs_true']:+.3f} "
+            f"intero_gap={diag['intero_error_calm_vs_true']:+.3f} | "
+            f"Δbelief={diag['belief_calm_delta']:+.4f} "
+            f"pinned={int(diag['belief_calm_pinned'])} | "
             f"EFE: {efe:.3f}"
         )
         
@@ -135,16 +172,103 @@ def run_simulation(steps=150):
             history["loss_trans"].append(0.0)
             history["loss_obs"].append(0.0)
             history["loss_essential"].append(0.0)
+
+        for key in DIAGNOSTIC_FIELDS:
+            history[key].append(diag.get(key))
+        diag_rows.append({
+            "step": step,
+            "true_calm": true_calm,
+            "belief_calm": diag["belief_calm"],
+            **{k: diag.get(k) for k in DIAGNOSTIC_FIELDS},
+        })
             
         # Update trackers
         obs = next_obs
         last_action = action
         
     logger.info("Simulation execution complete! Saving results and generating visualizations...")
+
+    if diagnostic_csv:
+        _write_diagnostic_csv(diagnostic_csv, diag_rows)
+        logger.info("Inference diagnostics saved to %s", diagnostic_csv)
+
+    _log_diagnostic_summary(logger, history, steps)
     
     # 6. Render Premium Visualization
     plot_results(history)
     logger.info("Visualization saved to logs/butler_performance.png")
+
+
+def _write_diagnostic_csv(path, rows):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["step", "true_calm", "belief_calm"] + DIAGNOSTIC_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _log_diagnostic_summary(logger, history, steps):
+    """High-signal summary: obs model vs intero model vs belief update."""
+    pred_obs = np.array(history["predicted_calm_obs"], dtype=float)
+    pred_intero = np.array(history["predicted_calm_intero"], dtype=float)
+    err_true = np.array(history["obs_error_calm_vs_true"], dtype=float)
+    intero_gap = np.array(history["intero_error_calm_vs_true"], dtype=float)
+    belief = np.array(history["belief_calm"], dtype=float)
+    true_calm = np.array(history["true_calm"], dtype=float)
+    delta = np.array(history["belief_calm_delta"], dtype=float)
+    sensory = np.array(history["sensory_error_calm"], dtype=float)
+    pinned = np.array(history["belief_calm_pinned"], dtype=float)
+
+    def _phase(name, start, stop):
+        if start >= stop:
+            return
+        sl = slice(start, stop)
+        trans_err = history["transition_error_calm"][sl]
+        trans_vals = [x for x in trans_err if x is not None]
+        trans_mean = np.mean(np.abs(trans_vals)) if trans_vals else float("nan")
+        logger.info(
+            "%s (steps %d-%d): true=%.3f belief=%.3f |obs_err|=%.3f "
+            "|intero_gap|=%.3f |Δbelief|=%.4f sensory=%.5f pinned=%.0f%% "
+            "trans_err=%.3f",
+            name,
+            start,
+            stop - 1,
+            np.mean(true_calm[sl]),
+            np.mean(belief[sl]),
+            np.mean(np.abs(err_true[sl])),
+            np.mean(np.abs(intero_gap[sl])),
+            np.mean(np.abs(delta[sl])),
+            np.mean(sensory[sl]),
+            100.0 * np.mean(pinned[sl]),
+            trans_mean,
+        )
+
+    logger.info("--- Calm inference diagnostic summary ---")
+    _phase("Early", 0, min(20, steps))
+    if steps > 40:
+        _phase("Mid (delusion onset ~50)", 40, min(60, steps))
+    _phase("Late", max(0, steps - 20), steps)
+    logger.info(
+        "Full run: pred_obs=%.3f pred_intero=%.3f true=%.3f belief=%.3f | "
+        "mean |obs_err|=%.3f mean |intero_gap|=%.3f pinned=%.0f%%",
+        pred_obs.mean(),
+        pred_intero.mean(),
+        true_calm.mean(),
+        belief.mean(),
+        np.mean(np.abs(err_true)),
+        np.mean(np.abs(intero_gap)),
+        100.0 * pinned.mean(),
+    )
+    if np.mean(np.abs(intero_gap)) > np.mean(np.abs(err_true)) + 0.05:
+        logger.info(
+            "Diagnosis hint: interoceptive head over-predicts Calm more than "
+            "observation model — EFE planner likely acting on intero delusion."
+        )
+    elif np.mean(np.abs(err_true)) > 0.1 and np.mean(np.abs(delta)) < 0.01:
+        logger.info(
+            "Diagnosis hint: large obs error but tiny belief updates — "
+            "inference ignoring sensory evidence or beliefs pinned at clip bounds."
+        )
 
 def plot_results(history):
     """Generates a beautiful, publication-ready visualization of the simulation run."""
@@ -222,4 +346,12 @@ def plot_results(history):
     plt.close()
 
 if __name__ == "__main__":
-    run_simulation(150)
+    parser = argparse.ArgumentParser(description="MyButler active inference simulation")
+    parser.add_argument("--steps", type=int, default=150, help="Simulation length")
+    parser.add_argument(
+        "--diagnostic-csv",
+        default="logs/inference_diagnostics.csv",
+        help="CSV path for per-step calm inference diagnostics",
+    )
+    args = parser.parse_args()
+    run_simulation(steps=args.steps, diagnostic_csv=args.diagnostic_csv)

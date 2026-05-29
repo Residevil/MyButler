@@ -32,6 +32,10 @@ class ActiveInferenceAgent:
         
         # 5. Exploration/Curiosity parameters
         self.beta = 0.15                # Weight of curiosity drive (epistemic value)
+
+        # Essential variable indices in state / observation vectors
+        self.ESSENTIAL_NAMES = ("comfort", "health", "calm", "engagement")
+        self.CALM_IDX = 2
         
     def reset(self, initial_obs):
         """Resets the agent's belief state to match initial observations."""
@@ -49,42 +53,82 @@ class ActiveInferenceAgent:
         Sensory Correction / Online Belief Inference.
         Updates the internal state estimation (belief_state) to minimize 
         Variational Free Energy (difference between expected and actual sensory inputs).
+
+        Returns (belief_numpy, diagnostics_dict) for logging inference quality.
         """
         self.gen_model.eval()
-        
-        # We perform a few steps of gradient descent on belief state
-        s_belief = self.belief_state.clone().detach().requires_grad_(True)
-        optimizer = torch.optim.SGD([s_belief], lr=0.1)
-        
+        belief_pre = self.belief_state.clone()
+        calm_idx = self.CALM_IDX
         obs_t = torch.tensor(observation, dtype=torch.float32)
-        
-        # Number of belief adjustment iterations (predictive coding correction steps)
+        sensory_error_calm_final = 0.0
+
+        with torch.no_grad():
+            pred_calm_pre = self.gen_model.observation_model(belief_pre).squeeze()[calm_idx].item()
+            intero_calm_pre = self.gen_model.interoceptive_model(belief_pre).squeeze()[calm_idx].item()
+
+            transition_pred_calm = None
+            transition_logvar_calm = None
+            if last_action is not None:
+                next_mean, logvar = self.gen_model.transition_model(
+                    belief_pre, torch.tensor([last_action])
+                )
+                transition_pred_calm = next_mean[0, calm_idx].item()
+                transition_logvar_calm = logvar[0, calm_idx].item()
+
+        s_belief = belief_pre.clone().detach().requires_grad_(True)
+        optimizer = torch.optim.SGD([s_belief], lr=0.1)
+
         for _ in range(5):
             optimizer.zero_grad()
-            
-            # Predict observation from current belief
-            obs_pred = self.gen_model.observation_model(s_belief)
-            
-            # Variational Free Energy bounds:
-            # 1. Sensory prediction error (accuracy term)
-            sensory_error = torch.mean((obs_pred - obs_t)**2)
-            
-            # 2. Dynamic transition prediction error (complexity term, if previous step exists)
+            obs_pred = self.gen_model.observation_model(s_belief).squeeze(0)
+            sensory_error = torch.mean((obs_pred - obs_t) ** 2)
+            sensory_error_calm_final = ((obs_pred[calm_idx] - obs_t[calm_idx]) ** 2).item()
+
             transition_error = 0.0
-            if last_action is not None:
-                # Expect state to match previous transition prediction
-                prev_state_pred, logvar = self.gen_model.transition_model(self.belief_state, torch.tensor([last_action]))
-                transition_error = torch.mean(torch.exp(-logvar) * (s_belief - prev_state_pred)**2)
-                
+            if last_action is not None and transition_pred_calm is not None:
+                prev_state_pred, logvar = self.gen_model.transition_model(
+                    belief_pre, torch.tensor([last_action])
+                )
+                transition_error = torch.mean(
+                    torch.exp(-logvar) * (s_belief - prev_state_pred) ** 2
+                )
+
             loss = sensory_error + 0.1 * transition_error
             loss.backward()
             optimizer.step()
-            
+
+        belief_calm_raw = s_belief[calm_idx].item()
         self.belief_state = s_belief.clone().detach()
-        # Ensure belief variables that are homeostatic stay bounded
         self.belief_state[:4] = torch.clip(self.belief_state[:4], 0.0, 1.0)
-        
-        return self.belief_state.numpy()
+        belief_calm = self.belief_state[calm_idx].item()
+
+        with torch.no_grad():
+            obs_pred = self.gen_model.observation_model(self.belief_state).squeeze(0)
+            intero_pred = self.gen_model.interoceptive_model(self.belief_state).squeeze(0)
+
+        diagnostics = {
+            "belief_calm": belief_calm,
+            "belief_calm_pre": belief_pre[calm_idx].item(),
+            "belief_calm_raw": belief_calm_raw,
+            "belief_calm_delta": belief_calm - belief_pre[calm_idx].item(),
+            "belief_calm_pinned": (
+                abs(belief_calm_raw - belief_calm) > 1e-4
+                or belief_calm <= 1e-4
+                or belief_calm >= 1.0 - 1e-4
+            ),
+            "predicted_calm_obs_pre": pred_calm_pre,
+            "predicted_calm_obs": obs_pred[calm_idx].item(),
+            "predicted_calm_intero_pre": intero_calm_pre,
+            "predicted_calm_intero": intero_pred[calm_idx].item(),
+            "obs_calm": observation[calm_idx],
+            "obs_error_calm_vs_obs": (obs_pred[calm_idx] - obs_t[calm_idx]).item(),
+            "obs_error_calm_vs_true": None,
+            "intero_error_calm_vs_true": None,
+            "sensory_error_calm": sensory_error_calm_final,
+            "transition_pred_calm": transition_pred_calm,
+            "transition_logvar_calm": transition_logvar_calm,
+        }
+        return self.belief_state.numpy(), diagnostics
 
     def select_action(self):
         """
